@@ -80,6 +80,9 @@ locals {
     },
   ]
 
+  # ECS BYOC
+  ecs_cluster_id = var.ecs_cluster_id == "" ? module.ecs.ecs_cluster_id : var.ecs_cluster_id
+
   # ECS task definition
   latest_task_definition_rev = var.external_task_definition_updates ? max(aws_ecs_task_definition.atlantis.revision, data.aws_ecs_task_definition.atlantis[0].revision) : aws_ecs_task_definition.atlantis.revision
 
@@ -475,8 +478,9 @@ resource "aws_efs_access_point" "this" {
 # ECS
 ################################################################################
 module "ecs" {
-  source  = "terraform-aws-modules/ecs/aws"
-  version = "v3.3.0"
+  source     = "terraform-aws-modules/ecs/aws"
+  version    = "v3.3.0"
+  create_ecs = var.ecs_cluster_id == ""
 
   create_ecs = var.create_ecs_cluster
 
