@@ -102,6 +102,18 @@ variable "private_subnets" {
 }
 
 # ALB
+variable "alb_arn" {
+  description = "ARN of an existing ALB where listener rules will be created"
+  type        = string
+  default     = ""
+}
+
+variable "alb_security_group" {
+  description = "Security group id of existing LB to allow ingress from for the ECS task"
+  type        = string
+  default     = ""
+}
+
 variable "alb_ingress_cidr_blocks" {
   description = "List of IPv4 CIDR ranges to use on all ingress rules of the ALB."
   type        = list(string)
@@ -174,6 +186,12 @@ variable "allow_unauthenticated_webhook_access_priority" {
   default     = 15
 }
 
+variable "default_access_priority" {
+  description = "ALB listener rule priority for default access rule"
+  type        = number
+  default     = 19
+}
+
 variable "allow_github_webhooks" {
   description = "Whether to allow access for GitHub webhooks"
   type        = bool
@@ -243,7 +261,7 @@ variable "route53_private_zone" {
 }
 
 variable "create_route53_record" {
-  description = "Whether to create Route53 A record for Atlantis"
+  description = "Whether to create Route53 record for Atlantis"
   type        = bool
   default     = true
 }
@@ -288,12 +306,6 @@ variable "atlantis_bitbucket_user_token_ssm_parameter_name" {
 
 variable "ssm_kms_key_arn" {
   description = "ARN of KMS key to use for encryption and decryption of SSM Parameters. Required only if your key uses a custom KMS key and not the default key"
-  type        = string
-  default     = ""
-}
-
-variable "ecs_cluster_id" {
-  description = "ID of an existing ECS cluster, where services will be created"
   type        = string
   default     = ""
 }
@@ -555,12 +567,6 @@ variable "atlantis_port" {
 variable "atlantis_repo_allowlist" {
   description = "List of allowed repositories Atlantis can be used with"
   type        = list(string)
-}
-
-variable "allow_repo_config" {
-  description = "When true allows the use of atlantis.yaml config files within the source repos."
-  type        = string
-  default     = "false"
 }
 
 variable "atlantis_log_level" {

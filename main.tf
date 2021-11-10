@@ -35,10 +35,6 @@ locals {
 
   container_definition_environment = [
     {
-      name  = "ATLANTIS_ALLOW_REPO_CONFIG"
-      value = var.allow_repo_config
-    },
-    {
       name  = "ATLANTIS_GITLAB_HOSTNAME"
       value = var.atlantis_gitlab_hostname
     },
@@ -80,11 +76,13 @@ locals {
     },
   ]
 
-  # ECS BYOC
-  ecs_cluster_id = var.ecs_cluster_id == "" ? module.ecs.ecs_cluster_id : var.ecs_cluster_id
-
   # ECS task definition
   latest_task_definition_rev = var.external_task_definition_updates ? max(aws_ecs_task_definition.atlantis.revision, data.aws_ecs_task_definition.atlantis[0].revision) : aws_ecs_task_definition.atlantis.revision
+
+  # ALB
+  create_lb          = var.alb_arn == ""
+  alb_arn            = local.create_lb ? module.alb.lb_arn : var.alb_arn
+  alb_security_group = local.create_lb ? module.alb_https_sg.security_group_id : var.alb_security_group
 
   # Secret access tokens
   container_definition_secrets_1 = local.secret_name_key != "" && local.secret_name_value_from != "" ? [
@@ -220,12 +218,25 @@ module "vpc" {
 ################################################################################
 # ALB
 ################################################################################
+
+data "aws_lb" "alb" {
+  arn = local.alb_arn
+}
+
+data "aws_lb_listener" "https_listener" {
+  load_balancer_arn = local.alb_arn
+  port              = 443
+}
+
 module "alb" {
-  source  = "terraform-aws-modules/alb/aws"
-  version = "v6.5.0"
+  source = "git@github.com:endrec/terraform-aws-alb.git?ref=byo"
+  #  source  = "terraform-aws-modules/alb/aws"
+  #  version = "v6.10.0"
 
   name     = var.name
   internal = var.internal
+
+  create_lb = local.create_lb
 
   vpc_id          = local.vpc_id
   subnets         = local.public_subnet_ids
@@ -246,13 +257,15 @@ module "alb" {
   listener_ssl_policy_default = var.alb_listener_ssl_policy_default
   https_listeners = [
     {
-      target_group_index   = 0
-      port                 = 443
-      protocol             = "HTTPS"
-      certificate_arn      = var.certificate_arn == "" ? module.acm.acm_certificate_arn : var.certificate_arn
-      action_type          = local.alb_authentication_method
-      authenticate_oidc    = var.alb_authenticate_oidc
-      authenticate_cognito = var.alb_authenticate_cognito
+      port            = 443
+      protocol        = "HTTPS"
+      certificate_arn = var.certificate_arn == "" ? module.acm.acm_certificate_arn : var.certificate_arn
+      action_type     = "fixed-response"
+      fixed_response = {
+        content_type = "text/plain"
+        status_code  = "404"
+        message_body = "Not found."
+      }
     },
   ]
 
@@ -285,11 +298,17 @@ module "alb" {
   tags = local.tags
 }
 
+resource "aws_lb_listener_certificate" "cert" {
+  count           = local.create_lb ? 0 : 1
+  listener_arn    = data.aws_lb_listener.https_listener.arn
+  certificate_arn = var.certificate_arn == "" ? module.acm.acm_certificate_arn : var.certificate_arn
+}
+
 # Forward action for certain CIDR blocks to bypass authentication (eg. GitHub webhooks)
 resource "aws_lb_listener_rule" "unauthenticated_access_for_cidr_blocks" {
   count = var.allow_unauthenticated_access ? length(local.whitelist_unauthenticated_cidr_block_chunks) : 0
 
-  listener_arn = module.alb.https_listener_arns[0]
+  listener_arn = data.aws_lb_listener.https_listener.arn
   priority     = var.allow_unauthenticated_access_priority + count.index
 
   action {
@@ -302,13 +321,18 @@ resource "aws_lb_listener_rule" "unauthenticated_access_for_cidr_blocks" {
       values = local.whitelist_unauthenticated_cidr_block_chunks[count.index]
     }
   }
+  condition {
+    host_header {
+      values = [join(".", [var.name, var.route53_zone_name])]
+    }
+  }
 }
 
 # Forward action for certain URL paths to bypass authentication (eg. GitHub webhooks)
 resource "aws_lb_listener_rule" "unauthenticated_access_for_webhook" {
   count = var.allow_unauthenticated_access && var.allow_github_webhooks ? 1 : 0
 
-  listener_arn = module.alb.https_listener_arns[0]
+  listener_arn = data.aws_lb_listener.https_listener.arn
   priority     = var.allow_unauthenticated_webhook_access_priority
 
   action {
@@ -321,6 +345,70 @@ resource "aws_lb_listener_rule" "unauthenticated_access_for_webhook" {
       values = ["/events"]
     }
   }
+  condition {
+    host_header {
+      values = [join(".", [var.name, var.route53_zone_name])]
+    }
+  }
+}
+
+# "Default" action
+resource "aws_lb_listener_rule" "default" {
+  listener_arn = data.aws_lb_listener.https_listener.arn
+  priority     = var.default_access_priority
+
+  dynamic "action" {
+    for_each = length(keys(var.alb_authenticate_oidc)) > 0 || length(keys(var.alb_authenticate_cognito)) > 0 ? [1] : []
+    content {
+      type = local.alb_authentication_method
+      dynamic "authenticate_oidc" {
+        for_each = length(keys(var.alb_authenticate_oidc)) > 0 ? [var.alb_authenticate_oidc] : []
+
+        content {
+          # Max 10 extra params
+          authentication_request_extra_params = lookup(authenticate_oidc.value, "authentication_request_extra_params", null)
+          authorization_endpoint              = authenticate_oidc.value["authorization_endpoint"]
+          client_id                           = authenticate_oidc.value["client_id"]
+          client_secret                       = authenticate_oidc.value["client_secret"]
+          issuer                              = authenticate_oidc.value["issuer"]
+          on_unauthenticated_request          = lookup(authenticate_oidc.value, "on_unauthenticated_request", null)
+          scope                               = lookup(authenticate_oidc.value, "scope", null)
+          session_cookie_name                 = lookup(authenticate_oidc.value, "session_cookie_name", null)
+          session_timeout                     = lookup(authenticate_oidc.value, "session_timeout", null)
+          token_endpoint                      = authenticate_oidc.value["token_endpoint"]
+          user_info_endpoint                  = authenticate_oidc.value["user_info_endpoint"]
+        }
+      }
+
+      dynamic "authenticate_cognito" {
+        for_each = length(keys(var.alb_authenticate_cognito)) > 0 ? [var.alb_authenticate_cognito] : []
+
+        content {
+          # Max 10 extra params
+          authentication_request_extra_params = lookup(authenticate_cognito.value, "authentication_request_extra_params", null)
+          on_unauthenticated_request          = lookup(authenticate_cognito.value, "on_authenticated_request", null)
+          scope                               = lookup(authenticate_cognito.value, "scope", null)
+          session_cookie_name                 = lookup(authenticate_cognito.value, "session_cookie_name", null)
+          session_timeout                     = lookup(authenticate_cognito.value, "session_timeout", null)
+          user_pool_arn                       = authenticate_cognito.value["user_pool_arn"]
+          user_pool_client_id                 = authenticate_cognito.value["user_pool_client_id"]
+          user_pool_domain                    = authenticate_cognito.value["user_pool_domain"]
+        }
+      }
+    }
+
+  }
+
+  action {
+    type             = "forward"
+    target_group_arn = module.alb.target_group_arns[0]
+  }
+
+  condition {
+    host_header {
+      values = [join(".", [var.name, var.route53_zone_name])]
+    }
+  }
 }
 
 ################################################################################
@@ -329,6 +417,7 @@ resource "aws_lb_listener_rule" "unauthenticated_access_for_webhook" {
 module "alb_https_sg" {
   source  = "terraform-aws-modules/security-group/aws//modules/https-443"
   version = "v4.3.0"
+  create  = local.create_lb
 
   name        = "${var.name}-alb-https"
   vpc_id      = local.vpc_id
@@ -343,6 +432,7 @@ module "alb_https_sg" {
 module "alb_http_sg" {
   source  = "terraform-aws-modules/security-group/aws//modules/http-80"
   version = "v4.3.0"
+  create  = local.create_lb
 
   name        = "${var.name}-alb-http"
   vpc_id      = local.vpc_id
@@ -368,7 +458,7 @@ module "atlantis_sg" {
       to_port                  = var.atlantis_port
       protocol                 = "tcp"
       description              = "Atlantis"
-      source_security_group_id = module.alb_https_sg.security_group_id
+      source_security_group_id = local.alb_security_group
     },
   ]
 
@@ -422,8 +512,8 @@ resource "aws_route53_record" "atlantis" {
   type    = "A"
 
   alias {
-    name                   = module.alb.lb_dns_name
-    zone_id                = module.alb.lb_zone_id
+    name                   = data.aws_lb.alb.dns_name
+    zone_id                = data.aws_lb.alb.zone_id
     evaluate_target_health = true
   }
 }
@@ -436,8 +526,8 @@ resource "aws_route53_record" "atlantis_aaaa" {
   type    = "AAAA"
 
   alias {
-    name                   = module.alb.lb_dns_name
-    zone_id                = module.alb.lb_zone_id
+    name                   = data.aws_lb.alb.dns_name
+    zone_id                = data.aws_lb.alb.dns_name
     evaluate_target_health = true
   }
 }
@@ -478,9 +568,8 @@ resource "aws_efs_access_point" "this" {
 # ECS
 ################################################################################
 module "ecs" {
-  source     = "terraform-aws-modules/ecs/aws"
-  version    = "v3.3.0"
-  create_ecs = var.ecs_cluster_id == ""
+  source  = "terraform-aws-modules/ecs/aws"
+  version = "v3.5.0"
 
   create_ecs = var.create_ecs_cluster
 
@@ -559,7 +648,7 @@ data "aws_iam_policy_document" "ecs_task_access_secrets" {
 data "aws_iam_policy_document" "ecs_task_access_secrets_with_kms" {
   count = var.ssm_kms_key_arn == "" ? 0 : 1
 
-  source_json = data.aws_iam_policy_document.ecs_task_access_secrets.json
+  source_policy_documents = [data.aws_iam_policy_document.ecs_task_access_secrets.json]
 
   statement {
     sid       = "AllowKMSDecrypt"
